@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>信貸投資記帳</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- 首次使用：輸入 GitHub 資料 repo 與 token -->
+<section id="setup" class="setup" hidden>
+  <h1>信貸投資記帳</h1>
+  <p class="muted">資料存放在你的 GitHub 私人 repo。這個網頁本身不含任何資料，需要你的存取權杖才能讀寫。</p>
+  <form id="setup-form" class="card">
+    <label>GitHub 帳號<input name="owner" required autocomplete="username"></label>
+    <label>資料 repo 名稱<input name="repo" value="invest-data" required></label>
+    <label>存取權杖（Fine-grained token）<input name="token" type="password" required autocomplete="off"></label>
+    <button type="submit" class="primary">連線</button>
+    <p id="setup-error" class="error"></p>
+  </form>
+  <details class="card">
+    <summary>如何建立存取權杖？</summary>
+    <ol>
+      <li>到 GitHub → 右上角頭像 → Settings → Developer settings → Personal access tokens → <b>Fine-grained tokens</b> → Generate new token。</li>
+      <li>Expiration 選一個期限（到期後回來重新產生即可）。</li>
+      <li>Repository access 選 <b>Only select repositories</b>，只勾選資料 repo（invest-data）。</li>
+      <li>Permissions → Repository permissions：<b>Contents: Read and write</b>、<b>Actions: Read and write</b>。</li>
+      <li>產生後複製貼到上方。權杖只會存在這台裝置的瀏覽器裡，按「登出」即可清除。</li>
+    </ol>
+  </details>
+</section>
+
+<!-- 主畫面 -->
+<div id="main" hidden>
+  <header class="topbar">
+    <h1>信貸投資記帳</h1>
+    <div class="topbar-actions">
+      <span id="sync-status" class="muted small"></span>
+      <button id="btn-prices" title="觸發 GitHub Actions 抓最新報價">更新報價</button>
+      <button id="btn-reload" title="重新讀取資料">重新整理</button>
+      <button id="btn-logout" class="ghost">登出</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="overview" class="active">總覽</button>
+    <button role="tab" data-tab="tx">交易紀錄</button>
+    <button role="tab" data-tab="prices">基金 / 手動價格</button>
+    <button role="tab" data-tab="loan">信貸設定</button>
+  </nav>
+
+  <main>
+    <!-- 總覽 -->
+    <section id="tab-overview" class="tab active">
+      <div id="cards" class="cards"></div>
+      <div class="section-head">
+        <h2>持倉明細</h2>
+        <span id="price-status" class="small"></span>
+      </div>
+      <div class="table-wrap">
+        <table id="hold-table">
+          <thead><tr>
+            <th>市場</th><th>代號</th><th>名稱</th><th class="num">數量</th><th class="num">平均成本</th>
+            <th class="num">持有成本</th><th class="num">現價</th><th class="num">市值(台幣)</th>
+            <th class="num">未實現損益</th><th class="num">報酬率</th><th class="num">已實現+股息</th><th>報價時間</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <label class="check"><input type="checkbox" id="show-closed"> 顯示已全部賣出的標的</label>
+    </section>
+
+    <!-- 交易紀錄 -->
+    <section id="tab-tx" class="tab">
+      <form id="tx-form" class="card form-grid" autocomplete="off">
+        <h2 class="full" id="tx-form-title">新增交易</h2>
+        <label>日期<input name="date" type="date" required></label>
+        <label>類型<select name="type"></select></label>
+        <label>市場<select name="market"></select></label>
+        <label>代號
+          <span class="inline">
+            <input name="symbol">
+            <button type="button" id="btn-fund-search" hidden>搜尋基金</button>
+          </span>
+        </label>
+        <label>名稱<input name="name"></label>
+        <label>數量<input name="quantity" inputmode="decimal"></label>
+        <label><span id="amount-label">花費台幣</span><input name="amount_twd" inputmode="decimal" required></label>
+        <label>成交單價(選填)<input name="unit_price" inputmode="decimal"></label>
+        <label class="wide">備註<input name="note"></label>
+        <p id="tx-hint" class="muted small full"></p>
+        <div class="full actions">
+          <button type="submit" class="primary" id="btn-save-tx">新增</button>
+          <button type="button" id="btn-clear-tx">清空</button>
+        </div>
+      </form>
+      <div class="section-head"><h2>交易清單</h2><span class="muted small">點選一筆可修改</span></div>
+      <div class="table-wrap">
+        <table id="tx-table">
+          <thead><tr>
+            <th>#</th><th>日期</th><th>類型</th><th>市場</th><th>代號</th><th>名稱</th><th class="num">數量</th>
+            <th class="num">成交單價</th><th class="num">台幣金額</th><th class="num">交易後現金</th><th>備註</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 基金 / 手動價格 -->
+    <section id="tab-prices" class="tab">
+      <p class="muted small">
+        基金：按「連結基金」搜尋並連結後，報價更新時會自動抓最新淨值（資料來源：鉅亨網，每日一次，境外基金通常延遲 1–2 天），外幣基金依即時匯率換算台幣。<br>
+        報價由 GitHub Actions 定時抓取（台股、美股交易時間每 30 分鐘，另每天一次）。抓不到時可手動輸入價格；下次自動抓價成功時會以新報價為準。
+      </p>
+      <div class="table-wrap">
+        <table id="price-table">
+          <thead><tr>
+            <th>市場</th><th>代號</th><th>名稱</th><th class="num">持有數量</th><th class="num">目前價格</th><th>幣別</th>
+            <th>來源</th><th>更新時間 / 淨值日</th><th>連結基金</th><th>手動價格</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 信貸設定 -->
+    <section id="tab-loan" class="tab">
+      <form id="loan-form" class="card form-grid">
+        <h2 class="full">信貸與資金設定</h2>
+        <label>投入投資的初始資金 (台幣)<input name="initial_capital" inputmode="decimal" required></label>
+        <label>信貸本金 (台幣)<input name="loan_principal" inputmode="decimal" required></label>
+        <label>年利率 (%)<input name="loan_rate" inputmode="decimal" required></label>
+        <label>期數 (月)<input name="loan_months" inputmode="numeric" required></label>
+        <label>撥款日<input name="loan_start" type="date" required></label>
+        <p class="muted small full">採本息平均攤還計算；假設每月還款由薪水支付，不從投資現金扣除。撥款日之後每滿一個月算繳一期。</p>
+        <div class="full actions"><button type="submit" class="primary">儲存設定</button></div>
+      </form>
+      <p id="loan-info" class="loan-info"></p>
+      <div class="table-wrap">
+        <table id="loan-table">
+          <thead><tr>
+            <th>期數</th><th>繳款日</th><th class="num">月付金</th><th class="num">利息</th><th class="num">本金</th>
+            <th class="num">剩餘本金</th><th>狀態</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<!-- 基金搜尋 -->
+<dialog id="fund-dialog">
+  <form method="dialog" class="dialog-body" id="fund-search-form">
+    <h2>搜尋基金</h2>
+    <div class="inline">
+      <input id="fund-q" placeholder="基金名稱或 ISIN">
+      <button type="button" id="btn-fund-q" class="primary">搜尋</button>
+    </div>
+    <p class="muted small">同一檔基金有多種級別（累積/配息、幣別），請對照銀行或基金平台對帳單上的名稱或 ISIN 選擇。</p>
+    <p id="fund-info" class="small"></p>
+    <ul id="fund-results" class="fund-results"></ul>
+    <div class="actions"><button value="cancel">取消</button></div>
+  </form>
+</dialog>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="calc.js"></script>
+<script src="github.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
