@@ -6,7 +6,10 @@
   "use strict";
 
   var TYPE_LABELS = { BUY: "買進", SELL: "賣出", DIVIDEND: "股息", INCOME: "其他收入" };
-  var MARKET_LABELS = { TW: "台股", US: "美股", FUND: "基金" };
+  var MARKET_LABELS = { TW: "台股", US: "美股", FUND: "基金", DEPOSIT: "定存" };
+  var DEPOSIT_MODE_LABELS = { COMPOUND: "整存整付（利息滾入本金）", PAYOUT: "存本取息（每月領息）" };
+  var DEPOSIT_RENEW_LABELS = { NONE: "不續存（到期停止計息）", PI: "本利續存", P: "本金續存（利息轉出）" };
+  var DAYS_PER_YEAR = 365;   // 台灣定存慣例：年以 365 天計，按實際天數計息
 
   function fxSymbol(currency) { return currency + "TWD"; }
   var FX_SYMBOL = fxSymbol("USD");
@@ -68,11 +71,14 @@
     return { holdings: holdings, cash_flow: cashFlow, realized: realizedTotal, income: incomeTotal };
   }
 
-  function valueHoldings(holdings, prices) {
+  function valueHoldings(holdings, prices, deposits, today) {
+    deposits = deposits || {};
+    today = today || todayStr();
     var rows = Object.keys(holdings).map(function (k) {
       var h = holdings[k], row = {};
       Object.keys(h).forEach(function (f) { row[f] = h[f]; });
       row.avg_cost = h.quantity ? h.cost / h.quantity : 0;
+      if (h.market === "DEPOSIT") return valueDeposit(row, h, deposits[h.symbol], today);
       var p = prices[h.symbol];
       row.price = p ? p.price : null;
       row.currency = p ? p.currency : (h.market === "US" ? "USD" : "TWD");
@@ -98,6 +104,116 @@
       return 0;
     });
     return rows;
+  }
+
+  /** 定存持倉的現值＝本金＋稅後利息−已領取的利息（已領的部分已經進到現金）。 */
+  function valueDeposit(row, h, dep, today) {
+    row.currency = "TWD";
+    row.deposit = null;
+    if (!dep || h.quantity <= 0) {
+      row.price = null;
+      row.price_time = "";
+      row.market_value = h.quantity <= 0 ? 0 : null;
+      row.unrealized = row.market_value !== null ? row.market_value - h.cost : null;
+      row.return_pct = null;
+      return row;
+    }
+    var st = depositState(dep, h.cost, today);
+    var value = st.value - h.dividends;
+    row.deposit = st;
+    row.price = value / h.quantity;
+    row.price_time = today;
+    row.market_value = value;
+    row.unrealized = value - h.cost;
+    row.return_pct = h.cost ? row.unrealized / h.cost * 100 : null;
+    return row;
+  }
+
+  function addDays(dateStr, n) {
+    var d = parseDate(dateStr), t = Date.UTC(d.y, d.m - 1, d.d) + n * 86400000, x = new Date(t);
+    return x.getUTCFullYear() + "-" + pad(x.getUTCMonth() + 1) + "-" + pad(x.getUTCDate());
+  }
+
+  function daysBetween(a, b) {
+    var x = parseDate(a), y = parseDate(b);
+    return Math.round((Date.UTC(y.y, y.m - 1, y.d) - Date.UTC(x.y, x.m - 1, x.d)) / 86400000);
+  }
+
+  /** 這一期的到期日。 */
+  function depositTermEnd(termStart, dep) {
+    var term = parseInt(dep.term, 10);
+    if (!(term > 0)) return null;
+    return (dep.term_unit || "M") === "D" ? addDays(termStart, term) : addMonths(termStart, term);
+  }
+
+  /**
+   * 依定存條件算出到今天的本金餘額、利息與現值。
+   * 利息按實際天數 / 365 計算；整存整付每月複利，存本取息每月計息不滾入。
+   */
+  function depositState(dep, principal, today) {
+    today = today || todayStr();
+    var start = dep.start;
+    var rate = Number(dep.rate || 0) / 100;
+    var renewRate = String(dep.renew_rate == null ? "" : dep.renew_rate).trim() !== ""
+      ? Number(dep.renew_rate) / 100 : rate;
+    var tax = Number(dep.tax_rate || 0) / 100;
+    var mode = dep.mode || "COMPOUND";
+    var renew = dep.renew || "NONE";
+    principal = Number(principal);
+
+    var balance = principal;    // 本金餘額（整存整付會滾入利息）
+    var payable = 0;            // 已發生但未滾入本金的利息（等待領取 / 已轉出）
+    var termInterest = 0;       // 本期已滾入的利息（本金續存時要轉出）
+    var termStart = start, curRate = rate;
+    var termEnd = depositTermEnd(termStart, dep);
+    var matured = false;
+    var pos = start, k = 1, terms = 1;
+
+    while (pos < today && termEnd && !matured && terms < 600) {
+      var nextMonth = addMonths(start, k);
+      var segEnd = [nextMonth, termEnd, today].sort()[0];
+      var interest = balance * curRate * daysBetween(pos, segEnd) / DAYS_PER_YEAR;
+      if (mode === "COMPOUND") {
+        balance += interest;
+        termInterest += interest;
+      } else {
+        payable += interest;
+      }
+      pos = segEnd;
+      if (pos === termEnd) {                          // 到期
+        if (renew === "NONE") {
+          matured = true;
+        } else {
+          if (renew === "P" && mode === "COMPOUND") {  // 本金續存：本期利息轉出
+            balance -= termInterest;
+            payable += termInterest;
+          } else if (renew === "PI" && mode === "PAYOUT") {   // 本利續存：累積利息滾入本金
+            balance += payable;
+            payable = 0;
+          }
+          termInterest = 0;
+          termStart = pos;
+          curRate = renewRate;
+          termEnd = depositTermEnd(termStart, dep);
+          terms += 1;
+        }
+      }
+      if (pos === nextMonth) k += 1;
+    }
+
+    var interestTotal = balance - principal + payable;
+    var value = principal + interestTotal * (1 - tax);
+    var projected = value;
+    if (termEnd && !matured) {    // 本期到期時的預估現值（假設利率不變）
+      var rest = balance * curRate * daysBetween(pos > start ? pos : start, termEnd) / DAYS_PER_YEAR;
+      projected = principal + (interestTotal + rest) * (1 - tax);
+    }
+    return {
+      principal: principal, balance: balance, payable: payable, interest_total: interestTotal,
+      interest_after_tax: interestTotal * (1 - tax), value: value, term_start: termStart, term_end: termEnd,
+      term_no: terms, rate_now: curRate * 100, matured: matured,
+      days_left: (termEnd && !matured) ? daysBetween(today, termEnd) : 0, projected_value: projected
+    };
   }
 
   /** 本息平均攤還表：[[期數, 月付金, 利息, 本金, 剩餘本金]] */
@@ -158,9 +274,9 @@
     };
   }
 
-  function summarize(settings, transactions, prices, today) {
+  function summarize(settings, transactions, prices, today, deposits) {
     var c = computeHoldings(sortTransactions(transactions));
-    var rows = valueHoldings(c.holdings, prices);
+    var rows = valueHoldings(c.holdings, prices, deposits, today);
     var initial = Number(settings.initial_capital);
     var cash = initial + c.cash_flow;
     var active = rows.filter(function (r) { return r.quantity > 0; });
@@ -222,6 +338,13 @@
       case "unlink_fund":
         delete doc.fund_links[op.symbol];
         break;
+      case "set_deposit":
+        if (!doc.deposits) doc.deposits = {};
+        doc.deposits[op.symbol] = op.deposit;
+        break;
+      case "delete_deposit":
+        if (doc.deposits) delete doc.deposits[op.symbol];
+        break;
       default:
         throw new Error("未知的操作：" + op.op);
     }
@@ -230,8 +353,11 @@
 
   return {
     TYPE_LABELS: TYPE_LABELS, MARKET_LABELS: MARKET_LABELS, FX_SYMBOL: FX_SYMBOL, fxSymbol: fxSymbol,
+    DEPOSIT_MODE_LABELS: DEPOSIT_MODE_LABELS, DEPOSIT_RENEW_LABELS: DEPOSIT_RENEW_LABELS,
     sortTransactions: sortTransactions, computeHoldings: computeHoldings, valueHoldings: valueHoldings,
-    loanSchedule: loanSchedule, addMonths: addMonths, loanStatus: loanStatus, summarize: summarize,
+    loanSchedule: loanSchedule, addMonths: addMonths, addDays: addDays, daysBetween: daysBetween,
+    depositTermEnd: depositTermEnd, depositState: depositState,
+    loanStatus: loanStatus, summarize: summarize,
     mergePrices: mergePrices, applyOp: applyOp, todayStr: todayStr
   };
 });

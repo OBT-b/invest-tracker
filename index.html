@@ -47,6 +47,7 @@
   <nav class="tabs" role="tablist">
     <button role="tab" data-tab="overview" class="active">總覽</button>
     <button role="tab" data-tab="tx">交易紀錄</button>
+    <button role="tab" data-tab="deposit">定存</button>
     <button role="tab" data-tab="prices">基金 / 手動價格</button>
     <button role="tab" data-tab="loan">信貸設定</button>
   </nav>
@@ -102,6 +103,48 @@
           <thead><tr>
             <th>#</th><th>日期</th><th>類型</th><th>市場</th><th>代號</th><th>名稱</th><th class="num">數量</th>
             <th class="num">成交單價</th><th class="num">台幣金額</th><th class="num">交易後現金</th><th>備註</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 定存 -->
+    <section id="tab-deposit" class="tab">
+      <form id="dep-form" class="card form-grid" autocomplete="off">
+        <h2 class="full" id="dep-form-title">新增定存</h2>
+        <label>名稱<input name="name" placeholder="例如 台銀 12 個月" required></label>
+        <label>本金 (台幣)<input name="principal" inputmode="decimal" required></label>
+        <label>起存日<input name="start" type="date" required></label>
+        <label>期間
+          <span class="inline">
+            <input name="term" inputmode="numeric" value="12" required>
+            <select name="term_unit"><option value="M">個月</option><option value="D">天</option></select>
+          </span>
+        </label>
+        <label>年利率 (%)<input name="rate" inputmode="decimal" required></label>
+        <label class="wide">計息方式<select name="mode"></select></label>
+        <label class="wide">到期處理<select name="renew"></select></label>
+        <label>續存利率 (%)<input name="renew_rate" inputmode="decimal" placeholder="留空＝沿用原利率"></label>
+        <label>預扣稅率 (%)<input name="tax_rate" inputmode="decimal" placeholder="0"></label>
+        <label class="wide">備註<input name="note"></label>
+        <p class="muted small full">
+          利息按實際天數 ÷ 365 計算。整存整付每月複利；存本取息每月計息、本金不變。<br>
+          利息會算在「定存現值」裡。實際領到利息時，到「交易紀錄」記一筆股息（或用下方的「記錄領息」），現金才會增加，總資產不會重複計算。<br>
+          單筆利息滿 2 萬會被扣 10% 稅與 2.11% 補充保費，需要時在「預扣稅率」填 12.11。
+        </p>
+        <div class="full actions">
+          <button type="submit" class="primary" id="btn-save-dep">新增定存</button>
+          <button type="button" id="btn-clear-dep">清空</button>
+        </div>
+      </form>
+      <div class="section-head"><h2>定存清單</h2><span class="muted small">點「編輯」可修改條件</span></div>
+      <div class="table-wrap">
+        <table id="dep-table">
+          <thead><tr>
+            <th>名稱</th><th class="num">本金</th><th class="num">年利率</th><th>起存日</th><th>本期到期日</th>
+            <th class="num">剩餘天數</th><th>計息 / 到期</th><th class="num">已發生利息</th><th class="num">已領利息</th>
+            <th class="num">現值</th><th class="num">本期到期預估</th><th>操作</th>
           </tr></thead>
           <tbody></tbody>
         </table>

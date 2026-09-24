@@ -12,7 +12,7 @@
 
   var state = {
     gh: null, doc: null, prices: {}, pricesSha: null, summary: null,
-    editingId: null, pendingLink: null, polling: false
+    editingId: null, editingDeposit: null, pendingLink: null, polling: false
   };
 
   // ------------------------------------------------------------------ 格式
@@ -161,11 +161,13 @@
 
   // ------------------------------------------------------------------ 畫面
   function mergedPrices() { return Calc.mergePrices(state.prices, state.doc.manual_prices); }
+  function deposits() { return state.doc.deposits || {}; }
 
   function render() {
-    state.summary = Calc.summarize(state.doc.settings, state.doc.transactions, mergedPrices());
+    state.summary = Calc.summarize(state.doc.settings, state.doc.transactions, mergedPrices(), null, deposits());
     renderOverview();
     renderTransactions();
+    renderDeposits();
     renderPrices();
     renderLoan();
   }
@@ -226,9 +228,175 @@
     }).join("") || '<tr><td colspan="12" class="muted">尚無交易</td></tr>';
   }
 
+  // ------------------------------------------------------------------ 定存
+  var depForm = function () { return $("#dep-form"); };
+
+  function renderDeposits() {
+    var deps = deposits();
+    var rows = state.summary.rows.filter(function (r) { return r.market === "DEPOSIT"; });
+    // 已解約但設定還在的也列出來，方便刪除
+    Object.keys(deps).forEach(function (sym) {
+      if (!rows.some(function (r) { return r.symbol === sym; })) {
+        rows.push({ symbol: sym, name: deps[sym].name || sym, quantity: 0, cost: 0, dividends: 0,
+          market_value: 0, deposit: null });
+      }
+    });
+    $("#dep-table tbody").innerHTML = rows.map(function (r) {
+      var dep = deps[r.symbol] || {}, st = r.deposit;
+      var closed = r.quantity <= 0;
+      var modes = (Calc.DEPOSIT_MODE_LABELS[dep.mode] || "").split("（")[0] + " / " +
+        (Calc.DEPOSIT_RENEW_LABELS[dep.renew] || "").split("（")[0];
+      return '<tr class="' + (closed ? "closed" : "") + '">' +
+        "<td>" + esc(r.name || dep.name || r.symbol) + '</td><td class="num">' + money(r.cost || dep.principal) +
+        '</td><td class="num">' + (st ? st.rate_now.toFixed(3) : Number(dep.rate || 0).toFixed(3)) + "%</td><td>" +
+        esc(dep.start || "") + "</td><td>" + (st && st.term_end ? st.term_end + (st.matured ? "（已到期）" : "") : "—") +
+        '</td><td class="num">' + (st && !st.matured ? st.days_left : "—") + "</td><td>" + esc(modes) +
+        '</td><td class="num">' + (st ? money(st.interest_after_tax) : "—") +
+        '</td><td class="num">' + money(r.dividends) + '</td><td class="num">' + money(r.market_value) +
+        '</td><td class="num">' + (st && !st.matured ? money(st.projected_value) : "—") +
+        '</td><td><button type="button" class="link" data-dep-edit="' + esc(r.symbol) + '">編輯</button>' +
+        (closed ? '<button type="button" class="link" data-dep-del="' + esc(r.symbol) + '">刪除</button>'
+          : '<button type="button" class="link" data-dep-int="' + esc(r.symbol) + '">記錄領息</button>' +
+            '<button type="button" class="link" data-dep-close="' + esc(r.symbol) + '">解約 / 到期領回</button>') +
+        "</td></tr>";
+    }).join("") || '<tr><td colspan="12" class="muted">尚無定存，用上方表單新增。</td></tr>';
+  }
+
+  function clearDepForm() {
+    var f = depForm();
+    state.editingDeposit = null;
+    f.reset();
+    f.elements.start.value = Calc.todayStr();
+    f.elements.term.value = "12";
+    $("#btn-save-dep").textContent = "新增定存";
+    $("#dep-form-title").textContent = "新增定存";
+  }
+
+  function readDepForm() {
+    var f = depForm();
+    function num(name, label, required, allowZero) {
+      var s = f.elements[name].value.trim().replace(/,/g, "");
+      if (!s) { if (required) throw new Error("請填寫" + label); return null; }
+      var v = Number(s);
+      if (!isFinite(v) || v < 0 || (!allowZero && v === 0)) throw new Error(label + "必須是" + (allowZero ? "0 或正數" : "大於 0 的數字"));
+      return v;
+    }
+    var name = f.elements.name.value.trim();
+    if (!name) throw new Error("請填寫名稱");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(f.elements.start.value)) throw new Error("請填寫起存日");
+    var term = num("term", "期間", true);
+    if (term !== Math.floor(term)) throw new Error("期間必須是整數");
+    return {
+      deposit: {
+        name: name, start: f.elements.start.value, term: term, term_unit: f.elements.term_unit.value,
+        rate: num("rate", "年利率", true, true), mode: f.elements.mode.value, renew: f.elements.renew.value,
+        renew_rate: f.elements.renew_rate.value.trim(), tax_rate: num("tax_rate", "預扣稅率", false, true) || 0,
+        note: f.elements.note.value.trim()
+      },
+      principal: num("principal", "本金", true)
+    };
+  }
+
+  function saveDeposit(e) {
+    e.preventDefault();
+    var input;
+    try { input = readDepForm(); } catch (err) { toast(err.message, true); return; }
+    var dep = input.deposit, sym = state.editingDeposit, ops = [];
+    if (!sym) {   // 新增：自動編號，並同時記一筆買進（現金轉入定存）
+      var used = deposits(), n = 1;
+      while (used["FD" + n]) n++;
+      sym = "FD" + n;
+      var cash = Number(state.doc.settings.initial_capital) +
+        Calc.computeHoldings(Calc.sortTransactions(state.doc.transactions.filter(function (x) {
+          return x.date <= dep.start;
+        }))).cash_flow;
+      if (input.principal > cash + 0.5 && !confirm("定存本金 " + money(input.principal) + " 超過當時現金 " +
+          money(cash) + "。\n仍要儲存嗎？")) return;
+      ops.push({ op: "add_tx", tx: { id: uuid(), date: dep.start, type: "BUY", market: "DEPOSIT", symbol: sym,
+        name: dep.name, quantity: 1, amount_twd: input.principal, unit_price: null, note: dep.note } });
+    } else {      // 編輯：本金或起存日改了，同步更新對應的買進交易
+      var tx = state.doc.transactions.filter(function (t) {
+        return t.market === "DEPOSIT" && t.symbol === sym && t.type === "BUY";
+      })[0];
+      if (tx && (tx.amount_twd !== input.principal || tx.date !== dep.start || tx.name !== dep.name)) {
+        ops.push({ op: "update_tx", id: tx.id, tx: { date: dep.start, type: "BUY", market: "DEPOSIT", symbol: sym,
+          name: dep.name, quantity: tx.quantity || 1, amount_twd: input.principal, unit_price: null, note: tx.note } });
+      }
+    }
+    ops.push({ op: "set_deposit", symbol: sym, deposit: dep });
+    commit(ops, (state.editingDeposit ? "修改定存：" : "新增定存：") + dep.name).then(function () {
+      clearDepForm();
+      toast("已儲存定存");
+    }, function () {});
+  }
+
+  function editDeposit(sym) {
+    var dep = deposits()[sym];
+    if (!dep) return;
+    var f = depForm(), row = state.summary.rows.filter(function (r) { return r.symbol === sym; })[0];
+    state.editingDeposit = sym;
+    f.elements.name.value = dep.name || "";
+    f.elements.principal.value = row && row.cost ? row.cost : (dep.principal || "");
+    f.elements.start.value = dep.start || "";
+    f.elements.term.value = dep.term;
+    f.elements.term_unit.value = dep.term_unit || "M";
+    f.elements.rate.value = dep.rate;
+    f.elements.mode.value = dep.mode || "COMPOUND";
+    f.elements.renew.value = dep.renew || "NONE";
+    f.elements.renew_rate.value = dep.renew_rate || "";
+    f.elements.tax_rate.value = dep.tax_rate || "";
+    f.elements.note.value = dep.note || "";
+    $("#btn-save-dep").textContent = "更新定存";
+    $("#dep-form-title").textContent = "修改定存（" + (dep.name || sym) + "）";
+    depForm().scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function askAmount(title, suggest) {
+    var s = prompt(title, suggest == null ? "" : String(Math.round(suggest)));
+    if (s === null) return null;
+    var v = Number(String(s).replace(/,/g, "").trim());
+    if (!(v > 0)) { toast("金額必須是大於 0 的數字", true); return null; }
+    var d = prompt("日期 (YYYY-MM-DD)", Calc.todayStr());
+    if (d === null) return null;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d.trim())) { toast("日期格式請用 YYYY-MM-DD", true); return null; }
+    return { amount: v, date: d.trim() };
+  }
+
+  function recordInterest(sym) {
+    var row = state.summary.rows.filter(function (r) { return r.symbol === sym; })[0];
+    var dep = deposits()[sym] || {};
+    // 整存整付的利息滾入本金、沒有未領利息，這時不給建議金額，由使用者填實際入帳金額
+    var payable = row && row.deposit ? row.deposit.payable * (1 - Number(dep.tax_rate || 0) / 100) : 0;
+    var suggest = payable > 0.5 ? payable : null;
+    var a = askAmount("實際入帳的利息金額（台幣）", suggest);
+    if (!a) return;
+    commit([{ op: "add_tx", tx: { id: uuid(), date: a.date, type: "DIVIDEND", market: "DEPOSIT", symbol: sym,
+      name: dep.name || sym, quantity: 0, amount_twd: a.amount, unit_price: null, note: "定存利息" } }],
+      "定存領息：" + (dep.name || sym)).then(function () { toast("已記錄領息"); }, function () {});
+  }
+
+  function closeDeposit(sym) {
+    var row = state.summary.rows.filter(function (r) { return r.symbol === sym; })[0];
+    var dep = deposits()[sym] || {};
+    var a = askAmount("實際領回的金額（本金＋利息，台幣）", row ? row.market_value : null);
+    if (!a) return;
+    commit([{ op: "add_tx", tx: { id: uuid(), date: a.date, type: "SELL", market: "DEPOSIT", symbol: sym,
+      name: dep.name || sym, quantity: row ? row.quantity : 1, amount_twd: a.amount, unit_price: null,
+      note: "定存領回" } }], "定存領回：" + (dep.name || sym)).then(function () {
+        toast("已記錄領回，定存結清");
+      }, function () {});
+  }
+
+  function deleteDeposit(sym) {
+    var dep = deposits()[sym] || {};
+    if (!confirm("刪除定存設定「" + (dep.name || sym) + "」？交易紀錄會保留。")) return;
+    commit([{ op: "delete_deposit", symbol: sym }], "刪除定存設定：" + (dep.name || sym))
+      .then(function () { clearDepForm(); toast("已刪除"); }, function () {});
+  }
+
   function renderPrices() {
     var prices = mergedPrices(), links = state.doc.fund_links;
-    var active = state.summary.rows.filter(function (r) { return r.quantity > 0; });
+    var active = state.summary.rows.filter(function (r) { return r.quantity > 0 && r.market !== "DEPOSIT"; });
     $("#price-table tbody").innerHTML = active.map(function (r) {
       var p = prices[r.symbol] || {}, link = links[r.symbol], linkCell = "";
       if (r.market === "FUND") {
@@ -278,6 +446,7 @@
     if (t === "BUY" || t === "SELL") {
       if (m === "TW") hint += " 台股代號填數字即可（如 2330、00878），數量以「股」計，一張 = 1000 股。";
       else if (m === "US") hint += " 美股代號如 AAPL、VOO；台幣金額請填實際換匯扣款金額，成交單價填美元。";
+      else if (m === "DEPOSIT") hint = "定存請到「定存」分頁新增，會自動記錄這筆交易並依條件計息。";
       else hint += " 按「搜尋基金」選擇基金即可自動追蹤每日淨值；數量填單位數，台幣金額填實際扣款金額。";
     }
     $("#tx-hint").textContent = hint;
@@ -528,6 +697,23 @@
       }
     });
 
+    var df = depForm();
+    df.elements.mode.innerHTML = Object.keys(Calc.DEPOSIT_MODE_LABELS).map(function (k) {
+      return '<option value="' + k + '">' + Calc.DEPOSIT_MODE_LABELS[k] + "</option>";
+    }).join("");
+    df.elements.renew.innerHTML = Object.keys(Calc.DEPOSIT_RENEW_LABELS).map(function (k) {
+      return '<option value="' + k + '">' + Calc.DEPOSIT_RENEW_LABELS[k] + "</option>";
+    }).join("");
+    df.addEventListener("submit", saveDeposit);
+    $("#btn-clear-dep").addEventListener("click", clearDepForm);
+    $("#dep-table").addEventListener("click", function (e) {
+      var t = e.target;
+      if (t.dataset.depEdit) editDeposit(t.dataset.depEdit);
+      else if (t.dataset.depInt) recordInterest(t.dataset.depInt);
+      else if (t.dataset.depClose) closeDeposit(t.dataset.depClose);
+      else if (t.dataset.depDel) deleteDeposit(t.dataset.depDel);
+    });
+
     $("#loan-form").addEventListener("submit", function (e) {
       e.preventDefault();
       var lf = e.target, vals = {};
@@ -557,6 +743,7 @@
 
   bind();
   clearForm();
+  clearDepForm();
   var cfg = GitHubStore.loadConfig();
   if (cfg) {
     connect(cfg).catch(function (e) { showSetup(errMsg(e)); });
